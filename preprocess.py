@@ -17,6 +17,12 @@ Key features
 - Saves each volume  → .npz  key='image'
         each mask   → .npz  key='mask'
 - Optional per-volume visualisation PNGs saved to vis_dir
+  Visualisation panels (5):
+    1. Original raw CT slice (HU, before any processing)
+    2. CT after preprocessing (clipped + normalised + gamma)
+    3. Liver mask
+    4. Tumour mask
+    5. Colour overlay (green = liver, red = tumour) on processed CT
 """
 
 from pathlib import Path
@@ -114,9 +120,9 @@ def _list_matched_pairs(dataset_in: Path):
         for p in dataset_in.rglob("segmentation-*.nii*")
     }
 
-    common       = sorted(set(vol_by_n) & set(seg_by_n))
-    unmatched_v  = sorted(set(vol_by_n) - set(seg_by_n))
-    unmatched_s  = sorted(set(seg_by_n) - set(vol_by_n))
+    common      = sorted(set(vol_by_n) & set(seg_by_n))
+    unmatched_v = sorted(set(vol_by_n) - set(seg_by_n))
+    unmatched_s = sorted(set(seg_by_n) - set(vol_by_n))
 
     if unmatched_v:
         print(f"[preprocess] WARNING: volumes with no matching segmentation: "
@@ -135,46 +141,76 @@ def _list_matched_pairs(dataset_in: Path):
 # ============================================================
 
 def _visualise_preprocessing(
-    ct_proc:  np.ndarray,   # (Z, H, W) float32  [0, 1]
+    raw_vol:  np.ndarray,   # (Z, H, W) float64  raw HU values from NIfTI
+    ct_proc:  np.ndarray,   # (Z, H, W) float32  [0, 1] after preprocessing
     seg_proc: np.ndarray,   # (Z, H, W) float32  labels 0/1/2
     stem:     str,
     vis_dir:  Path,
 ):
     """
-    Save a 4-panel PNG for one volume:
-        [ CT slice | liver mask | tumour mask | colour overlay ]
+    Save a 5-panel PNG for one volume at the most tumour-rich slice
+    (falls back to most liver-rich if no tumour present):
 
-    Selects the slice with the most tumour pixels
-    (or most liver pixels if no tumour present).
+        Panel 1 — Raw CT (original HU, no processing)
+        Panel 2 — CT after preprocessing (clipped + normalised + gamma)
+        Panel 3 — Liver mask
+        Panel 4 — Tumour mask
+        Panel 5 — Colour overlay on processed CT (green=liver, red=tumour)
+
+    Having the raw slice alongside the processed one makes it easy to
+    see the effect of HU clipping and gamma correction.
     """
     vis_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Pick the best slice to display ───────────────────────────────────────
     tumour_area = (seg_proc == 2).sum(axis=(1, 2))
     liver_area  = (seg_proc == 1).sum(axis=(1, 2))
-    if tumour_area.max() > 0:
-        idx = int(np.argmax(tumour_area))
-    else:
-        idx = int(np.argmax(liver_area))
+    idx = int(np.argmax(tumour_area)) if tumour_area.max() > 0 \
+          else int(np.argmax(liver_area))
 
-    ct_sl     = ct_proc[idx]
-    liver_m   = (seg_proc[idx] == 1).astype(np.float32)
-    tumour_m  = (seg_proc[idx] == 2).astype(np.float32)
+    # ── Raw slice: resize to OUT_SIZE for a fair side-by-side comparison ─────
+    raw_sl    = raw_vol[idx].astype(np.float32)
+    out_h, out_w = ct_proc.shape[1], ct_proc.shape[2]
+    raw_sl_r  = cv2.resize(raw_sl, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-    # Colour overlay: green = liver, red = tumour
+    # Normalise raw slice to [0, 1] purely for display (no gamma, no clipping)
+    # Uses the global min/max of that slice so extreme HU outliers don't
+    # wash out the liver region.
+    r_min, r_max = raw_sl_r.min(), raw_sl_r.max()
+    raw_disp  = (raw_sl_r - r_min) / (r_max - r_min + 1e-8)
+
+    # ── Processed slice + masks ───────────────────────────────────────────────
+    ct_sl    = ct_proc[idx]
+    liver_m  = (seg_proc[idx] == 1).astype(np.float32)
+    tumour_m = (seg_proc[idx] == 2).astype(np.float32)
+
+    # Colour overlay: green = liver, red = tumour, on processed CT
     overlay = np.stack([ct_sl, ct_sl, ct_sl], axis=-1).copy()
     overlay[..., 1] = np.clip(overlay[..., 1] + 0.35 * liver_m,  0, 1)
     overlay[..., 0] = np.clip(overlay[..., 0] + 0.45 * tumour_m, 0, 1)
 
-    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig, axs = plt.subplots(1, 5, figsize=(25, 5))
     fig.patch.set_facecolor("#111827")
-    data   = [ct_sl,  liver_m,   tumour_m,  overlay]
-    titles = ["CT (processed)", "Liver mask", "Tumour mask", "Overlay"]
-    cmaps  = ["gray", "Greens",  "Reds",    None]
 
-    for ax, img, title, cmap in zip(axs, data, titles, cmaps):
+    panels = [
+        (raw_disp, "Raw CT (original HU)",        "gray"),
+        (ct_sl,    "Processed CT",                 "gray"),
+        (liver_m,  "Liver mask",                   "Greens"),
+        (tumour_m, "Tumour mask",                  "Reds"),
+        (overlay,  "Overlay (green=liver, red=tumour)", None),
+    ]
+
+    for ax, (img, title, cmap) in zip(axs, panels):
         ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
-        ax.set_title(title, color="#e5e7eb", fontsize=10, pad=4)
+        ax.set_title(title, color="#e5e7eb", fontsize=9, pad=4)
         ax.axis("off")
+
+    # Annotate raw panel with HU range so the viewer knows the scale
+    axs[0].set_xlabel(
+        f"HU range: [{r_min:.0f}, {r_max:.0f}]",
+        color="#9ca3af", fontsize=8,
+    )
 
     pct_liver  = 100 * liver_m.mean()
     pct_tumour = 100 * tumour_m.mean()
@@ -183,9 +219,13 @@ def _visualise_preprocessing(
         f"liver {pct_liver:.1f}%  tumour {pct_tumour:.2f}%",
         color="#9ca3af", fontsize=9,
     )
+
     plt.tight_layout(pad=0.5)
-    plt.savefig(vis_dir / f"{stem}_preprocess.png", dpi=130,
-                bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(
+        vis_dir / f"{stem}_preprocess.png",
+        dpi=130, bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
     plt.close()
 
 
@@ -197,13 +237,13 @@ def preprocess_dataset(
     dataset_in:      str,
     img_dir:         str,
     mask_dir:        str,
-    clip_min:        int            = CLIP_MIN,
-    clip_max:        int            = CLIP_MAX,
-    out_size:        Tuple          = OUT_SIZE,
-    gamma:           float          = GAMMA,
-    min_mask_voxels: int            = MIN_MASK_VOXELS,
-    vis_dir:         Optional[str]  = None,
-    n_vis:           int            = 5,
+    clip_min:        int           = CLIP_MIN,
+    clip_max:        int           = CLIP_MAX,
+    out_size:        Tuple         = OUT_SIZE,
+    gamma:           float         = GAMMA,
+    min_mask_voxels: int           = MIN_MASK_VOXELS,
+    vis_dir:         Optional[str] = None,
+    n_vis:           int           = 5,
 ) -> int:
     """
     Preprocess all matched volume-N / segmentation-N pairs and save
@@ -253,13 +293,13 @@ def preprocess_dataset(
                                           out_size, gamma)
         seg_proc = preprocess_mask_soft(seg_nii, out_size)
 
-        # Use the volume stem as the shared key, e.g. "volume-3"
-        stem = vol_path.stem
+        stem = vol_path.stem   # e.g. "volume-3"
         np.savez_compressed(IMG_DIR  / f"{stem}.npz",      image=ct_proc)
         np.savez_compressed(MASK_DIR / f"{stem}_mask.npz", mask=seg_proc)
 
+        # Pass raw vol_nii into visualisation so panel 1 shows true HU
         if VIS_DIR is not None and i < n_vis:
-            _visualise_preprocessing(ct_proc, seg_proc, stem, VIS_DIR)
+            _visualise_preprocessing(vol_nii, ct_proc, seg_proc, stem, VIS_DIR)
 
         saved += 1
 
