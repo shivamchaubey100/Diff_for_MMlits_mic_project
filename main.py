@@ -522,7 +522,7 @@ def main():
     # Processes all 28 volumes, writes inpainted_volumes/
     # Visualises 5 volumes → vis/02_inpaint/
     # ------------------------------------------------------------------
-    if True:
+    if False:
         run_inpainting()
 
     # ------------------------------------------------------------------

@@ -42,7 +42,7 @@ from tqdm import tqdm
 CLIP_MIN        = -150
 CLIP_MAX        = 350
 OUT_SIZE        = (256, 256)
-GAMMA           = 2.0
+GAMMA           = 2
 MIN_MASK_VOXELS = 1000
 
 
