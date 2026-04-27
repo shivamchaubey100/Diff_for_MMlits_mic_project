@@ -201,7 +201,6 @@ def run_inpainting():
         processed_mask_dir = str(PROCESSED_MASKS),
         out_dir            = str(INPAINTED_DIR),
         force_binary       = False,
-        use_lama           = True,
         vis_dir            = str(VIS_INPAINT),
         n_vis              = 5,   # save PNGs for 5 volumes; processes all 28
     )
@@ -530,7 +529,7 @@ def main():
     # Trains on ALL slices from all 28 volumes
     # Visualises SEG_N_VIS samples per epoch → vis/03_seg_train/
     # ------------------------------------------------------------------
-    if False:
+    if True:
         run_segmentation_training()
 
     # ------------------------------------------------------------------
