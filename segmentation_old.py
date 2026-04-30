@@ -14,24 +14,12 @@ seg_loss            — combined weighted-CE + soft-Dice loss
 compute_seg_metrics — per-class Dice + mean IoU
 save_seg_checkpoint / load_seg_checkpoint
 predict_mask        — single 2-D slice  → predicted mask (H, W)
-predict_volume      — full 3-D volume   → predicted mask (Z, H, W)  [batched GPU]
+predict_volume      — full 3-D volume   → predicted mask (Z, H, W)
 visualise_seg_batch — save PNG panels for a batch (called from main.py)
-
-Fixes vs previous version
---------------------------
-1. SegDataset: pairing now uses numeric suffix matching (volume-N ↔
-   volume-N_mask) instead of lexicographic sort, fixing volume-10 before
-   volume-2 mismatch.
-2. predict_mask / autocast: replaced deprecated torch.cuda.amp.autocast
-   with torch.amp.autocast which works on both CPU and CUDA.
-3. load_seg_checkpoint: added weights_only=False to torch.load to silence
-   the FutureWarning on PyTorch ≥ 2.0.
-4. _augment: added np.ascontiguousarray after flip/rot90 so the returned
-   arrays are always C-contiguous (required by torch.from_numpy).
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import matplotlib
@@ -46,7 +34,7 @@ from torch.utils.data import Dataset
 # ============================================================
 # Constants
 # ============================================================
-NUM_CLASSES = 3
+NUM_CLASSES = 3          # 0 = background, 1 = liver, 2 = tumour
 FORCE_SIZE  = (256, 256)
 CLIP_MIN    = -150
 CLIP_MAX    = 350
@@ -71,55 +59,6 @@ def _resize(s: np.ndarray, size: Tuple, interp: int) -> np.ndarray:
 
 
 # ============================================================
-# Numeric pairing helper  (same pattern as inpainting.py)
-# ============================================================
-
-def _extract_number(path: Path) -> int:
-    """
-    Extract the leading integer from the first underscore-free token.
-    E.g. 'volume-3' → 3,  'volume-10_mask' → 10.
-    """
-    base   = path.stem.split("_")[0]
-    digits = "".join(filter(str.isdigit, base))
-    return int(digits) if digits else -1
-
-
-def _pair_img_mask(img_dir: str, mask_dir: str) -> List[Tuple[Path, Path]]:
-    """
-    Match image .npz (volume-N.npz) with mask .npz (volume-N_mask.npz)
-    by numeric suffix N.  Returns list sorted by N.
-
-    BUG FIXED: the old code used sorted(glob(...)) which puts volume-10
-    before volume-2 lexicographically, pairing wrong volumes together.
-    """
-    img_by_n:  Dict[int, Path] = {
-        _extract_number(p): p for p in Path(img_dir).glob("*.npz")
-    }
-    mask_by_n: Dict[int, Path] = {
-        _extract_number(p): p for p in Path(mask_dir).glob("*.npz")
-    }
-
-    common      = sorted(set(img_by_n) & set(mask_by_n))
-    unmatched_i = sorted(set(img_by_n)  - set(mask_by_n))
-    unmatched_m = sorted(set(mask_by_n) - set(img_by_n))
-
-    if unmatched_i:
-        print(f"[SegDataset] WARNING: images with no matching mask: "
-              f"{[img_by_n[k].name for k in unmatched_i]}")
-    if unmatched_m:
-        print(f"[SegDataset] WARNING: masks with no matching image: "
-              f"{[mask_by_n[k].name for k in unmatched_m]}")
-    if not common:
-        raise FileNotFoundError(
-            f"No matched image/mask pairs found.\n"
-            f"  img_dir : {img_dir}\n"
-            f"  mask_dir: {mask_dir}"
-        )
-
-    return [(img_by_n[n], mask_by_n[n]) for n in common]
-
-
-# ============================================================
 # Dataset
 # ============================================================
 
@@ -127,8 +66,9 @@ class SegDataset(Dataset):
     """
     Flat slice-level dataset for segmentation training.
 
-    Pairs image .npz (key='image') and mask .npz (key='mask') files
-    by numeric volume index — not by lexicographic sort order.
+    Scans img_dir for *.npz (key='image') and mask_dir for *.npz
+    (key='mask').  Files are paired by sorted order — they must
+    correspond 1-to-1 (same volume stem).
 
     Returns
     -------
@@ -144,16 +84,25 @@ class SegDataset(Dataset):
     ):
         self.augment = augment
 
-        pairs = _pair_img_mask(img_dir, mask_dir)
+        img_files  = sorted(Path(img_dir).glob("*.npz"))
+        mask_files = sorted(Path(mask_dir).glob("*.npz"))
+
+        if not img_files:
+            raise FileNotFoundError(f"No .npz files in {img_dir}")
+        if len(img_files) != len(mask_files):
+            raise ValueError(
+                f"Mismatch: {len(img_files)} images vs "
+                f"{len(mask_files)} masks in seg dataset."
+            )
 
         self.entries: List[Tuple[str, str, int]] = []
-        for ip, mp in pairs:
+        for ip, mp in zip(img_files, mask_files):
             Z = np.load(ip)["image"].shape[0]
             for z in range(Z):
                 self.entries.append((str(ip), str(mp), z))
 
         print(f"[SegDataset] {len(self.entries)} slices  "
-              f"({len(pairs)} volumes)")
+              f"({len(img_files)} volumes)")
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -164,8 +113,9 @@ class SegDataset(Dataset):
         img_s  = np.load(ip)["image"][z].astype(np.float32)
         mask_s = np.load(mp)["mask"][z].astype(np.int64)
 
+        # Preprocess
         img_pp = _preprocess_slice(img_s)
-        img_pp = _resize(img_pp, FORCE_SIZE, cv2.INTER_LINEAR)
+        img_pp = _resize(img_pp,  FORCE_SIZE, cv2.INTER_LINEAR)
         mask_r = _resize(mask_s.astype(np.float32),
                          FORCE_SIZE, cv2.INTER_NEAREST).astype(np.int64)
         mask_r = np.clip(mask_r, 0, NUM_CLASSES - 1)
@@ -173,7 +123,6 @@ class SegDataset(Dataset):
         if self.augment:
             img_pp, mask_r = _augment(img_pp, mask_r)
 
-        # np.ascontiguousarray required after flip/rot90 for torch.from_numpy
         img_t  = torch.from_numpy(np.ascontiguousarray(img_pp)[None]).float()
         mask_t = torch.from_numpy(np.ascontiguousarray(mask_r)).long()
         return img_t, mask_t
@@ -182,7 +131,7 @@ class SegDataset(Dataset):
 def _augment(
     img: np.ndarray, mask: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Lightweight geometric augmentation (numpy in-place safe)."""
+    """Lightweight geometric augmentation (numpy)."""
     import random
     if random.random() < 0.5:
         img  = np.flip(img,  axis=1)
@@ -194,19 +143,15 @@ def _augment(
         k    = random.choice([1, 2, 3])
         img  = np.rot90(img,  k)
         mask = np.rot90(mask, k)
-    # Ensure C-contiguous memory layout after flip/rot90
-    return np.ascontiguousarray(img), np.ascontiguousarray(mask)
+    return img, mask
 
 
 # ============================================================
 # Loss
 # ============================================================
 
-def dice_loss(
-    logits:  torch.Tensor,
-    targets: torch.Tensor,
-    smooth:  float = 1.0,
-) -> torch.Tensor:
+def dice_loss(logits: torch.Tensor, targets: torch.Tensor,
+              smooth: float = 1.0) -> torch.Tensor:
     """
     Soft multi-class Dice loss.
 
@@ -228,23 +173,17 @@ def seg_loss(
     ce_weight:     float                     = 1.0,
     dice_weight:   float                     = 1.0,
     class_weights: Optional[Sequence[float]] = (0.2, 1.0, 5.0),
-    device:        Optional[str]             = None,  # kept for API compat, ignored
+    device:        str                       = "cuda",
 ) -> torch.Tensor:
     """
     Combined cross-entropy + Dice loss.
 
     class_weights upweights rare classes (tumour = class 2).
     Default [0.2, 1.0, 5.0] heavily penalises missing tumour.
-
-    FIX: class_weights tensor is now created on logits.device instead of a
-    hardcoded "cuda" string.  Passing device="cpu" logits to the old code
-    would silently create the weight tensor on CUDA, causing a device
-    mismatch crash on cross_entropy.  The `device` argument is retained for
-    backward API compatibility but is no longer consulted.
     """
-    tensor_device = logits.device   # always matches logits — no string needed
     if class_weights is not None:
-        w  = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        w  = torch.tensor(class_weights, dtype=torch.float32,
+                          device=device)
         ce = F.cross_entropy(logits, targets, weight=w)
     else:
         ce = F.cross_entropy(logits, targets)
@@ -263,44 +202,19 @@ def compute_seg_metrics(
     num_classes: int = NUM_CLASSES,
 ) -> dict:
     """
-    Per-class Dice and mean IoU.
+    Compute per-class Dice and mean IoU.
 
     logits  : (B, C, H, W)
     targets : (B, H, W)  long
-
-    FIX: all comparisons and sums now stay on whatever device logits/targets
-    live on (GPU during training).  The old code called .item() inside the
-    per-class loop, causing one GPU→CPU sync per class per batch step.
-    Now we do vectorised tensor ops across all classes simultaneously and
-    pull a single flat array to CPU once at the very end.
     """
-    device = logits.device
-    preds  = logits.argmax(dim=1)   # (B, H, W) — stays on GPU
+    preds = logits.argmax(dim=1)
+    out   = {}
+    dices = []
+    ious  = []
 
-    # Build class indicator tensors for all classes at once: (C, B, H, W)
-    # arange gives [0, 1, 2] → compare against preds and targets in one op
-    cls = torch.arange(num_classes, device=device).view(-1, 1, 1, 1)  # (C,1,1,1)
-
-    pc    = (preds.unsqueeze(0)   == cls).float()   # (C, B, H, W)
-    tc    = (targets.unsqueeze(0) == cls).float()   # (C, B, H, W)
-
-    # Sum over B, H, W — stays on GPU
-    inter = (pc * tc).sum(dim=(1, 2, 3))            # (C,)
-    p_sum = pc.sum(dim=(1, 2, 3))                   # (C,)
-    t_sum = tc.sum(dim=(1, 2, 3))                   # (C,)
-    union = p_sum + t_sum                           # (C,)
-
-    dice  = (2.0 * inter + 1e-6) / (union + 1e-6)          # (C,)
-    iou   = (inter + 1e-6) / (union - inter + 1e-6)        # (C,)
-
-    # Single transfer: pull both vectors to CPU numpy in one call
-    dice_np = dice.cpu().numpy()
-    iou_np  = iou.cpu().numpy()
-
-    out = {}
     for c in range(num_classes):
-        pc    = (preds   == c).float()
-        tc    = (targets == c).float()
+        pc = (preds   == c).float()
+        tc = (targets == c).float()
         inter = (pc * tc).sum().item()
         union = pc.sum().item() + tc.sum().item()
         dice  = (2 * inter + 1e-6) / (union + 1e-6)
@@ -310,8 +224,8 @@ def compute_seg_metrics(
         dices.append(dice)
         ious.append(iou)
 
-    out["mean_dice"] = float(dice_np.mean())
-    out["mean_iou"]  = float(iou_np.mean())
+    out["mean_dice"] = float(np.mean(dices))
+    out["mean_iou"]  = float(np.mean(ious))
     return out
 
 
@@ -367,6 +281,8 @@ class SegUNet(nn.Module):
 
     Input  : (B, 1, 256, 256)
     Output : (B, 3, 256, 256)  — raw logits
+
+    base_ch : channel width at first encoder level (default 32)
     """
 
     def __init__(
@@ -377,16 +293,16 @@ class SegUNet(nn.Module):
     ):
         super().__init__()
         b = base_ch
-        self.enc1       = _DoubleConv(in_ch, b)
-        self.enc2       = _Down(b,      b * 2)
-        self.enc3       = _Down(b * 2,  b * 4)
-        self.enc4       = _Down(b * 4,  b * 8)
-        self.bottleneck = _Down(b * 8,  b * 16)
-        self.dec4       = _Up(b * 16, b * 8,  b * 8)
-        self.dec3       = _Up(b * 8,  b * 4,  b * 4)
-        self.dec2       = _Up(b * 4,  b * 2,  b * 2)
-        self.dec1       = _Up(b * 2,  b,      b)
-        self.head       = nn.Conv2d(b, num_class, 1)
+        self.enc1      = _DoubleConv(in_ch, b)
+        self.enc2      = _Down(b,     b * 2)
+        self.enc3      = _Down(b * 2, b * 4)
+        self.enc4      = _Down(b * 4, b * 8)
+        self.bottleneck= _Down(b * 8, b * 16)
+        self.dec4      = _Up(b * 16, b * 8,  b * 8)
+        self.dec3      = _Up(b * 8,  b * 4,  b * 4)
+        self.dec2      = _Up(b * 4,  b * 2,  b * 2)
+        self.dec1      = _Up(b * 2,  b,      b)
+        self.head      = nn.Conv2d(b, num_class, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         s1 = self.enc1(x)
@@ -427,25 +343,19 @@ def save_seg_checkpoint(
 def load_seg_checkpoint(
     model:    nn.Module,
     ckpt_dir: str,
-    device:   str = "cpu",   # FIX: was "cuda" — safe default that works without GPU
+    device:   str = "cuda",
     opt=None,
 ) -> Tuple[nn.Module, int]:
     """
     Load the latest seg_epoch_XXXX.pt from ckpt_dir.
     Returns (model, start_epoch).
-
-    FIX: default device changed from "cuda" to "cpu".  The old default would
-    crash on machines without a GPU.  The caller (main.py) always passes the
-    correct device string explicitly anyway.
     """
     import glob
     files = sorted(glob.glob(str(Path(ckpt_dir) / "seg_epoch_*.pt")))
     if not files:
         print(f"[seg] No checkpoint in {ckpt_dir} — starting from epoch 0.")
         return model, 0
-
-    # weights_only=False: required for checkpoints saved with optimizer state
-    ck = torch.load(files[-1], map_location=device, weights_only=False)
+    ck = torch.load(files[-1], map_location=device)
     model.load_state_dict(ck["model"], strict=True)
     if opt is not None and "optimizer" in ck:
         opt.load_state_dict(ck["optimizer"])
@@ -462,105 +372,55 @@ def load_seg_checkpoint(
 @torch.no_grad()
 def predict_mask(
     model:     nn.Module,
-    img_slice: np.ndarray,   # (H, W) raw HU float
+    img_slice: np.ndarray,   # (H, W)  raw HU float
     device:    str = "cuda",
 ) -> np.ndarray:
     """
     Predict segmentation mask for a single 2-D CT slice.
-    Returns np.ndarray (H, W) with values in {0, 1, 2}.
 
-    Prefer predict_volume for full 3-D volumes — it batches slices on GPU
-    and is significantly faster than calling this in a loop.
+    Returns np.ndarray (H, W) with values in {0, 1, 2}.
     """
     model.eval()
     pp = _preprocess_slice(img_slice)
     pp = _resize(pp, FORCE_SIZE, cv2.INTER_LINEAR)
     t  = torch.from_numpy(pp[None, None]).float().to(device)
-
-    # torch.amp.autocast replaces the deprecated torch.cuda.amp.autocast
-    # and works correctly on both CPU (no-op) and CUDA devices.
-    device_type = "cuda" if "cuda" in str(device) else "cpu"
-    with torch.amp.autocast(device_type=device_type, enabled=(device_type == "cuda")):
+    with torch.cuda.amp.autocast(enabled=(device != "cpu")):
         logits = model(t)
-
     return logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
 
 
 @torch.no_grad()
 def predict_volume(
     model:  nn.Module,
-    ct_vol: np.ndarray,   # (Z, H, W) raw HU float
+    ct_vol: np.ndarray,   # (Z, H, W)  raw HU float
     device: str = "cuda",
 ) -> np.ndarray:
     """
     Predict segmentation mask for a full 3-D CT volume.
+
     Returns np.ndarray (Z, H, W) with values in {0, 1, 2}.
-
-    FIX: replaced the old slice-by-slice Python loop with a batched GPU
-    path.  All preprocessing is vectorised over Z via numpy, then slices
-    are transferred to the device in one go and processed in mini-batches.
-
-    Old approach: Z individual model forward passes + Z GPU→CPU syncs.
-    New approach: ceil(Z / batch_size) forward passes, one GPU→CPU sync.
-    Typical speed-up: 10–30× for a 512-slice volume on a T4.
-
-    Args:
-        model      : SegUNet already on the target device
-        ct_vol     : (Z, H, W) array of raw HU values
-        device     : device string matching where model lives
-        batch_size : number of slices per forward pass (reduce if OOM)
     """
-    model.eval()
-    Z = ct_vol.shape[0]
-
-    # ── Preprocessing — fully vectorised over Z (no Python loop) ──────────
-    # _preprocess_slice operates element-wise, so we can apply it to the
-    # whole volume array at once.
-    vol_f  = np.clip(ct_vol, CLIP_MIN, CLIP_MAX).astype(np.float32)
-    vol_f  = (vol_f - CLIP_MIN) / float(CLIP_MAX - CLIP_MIN)
-    vol_f  = np.clip(vol_f, 0.0, 1.0)
-    vol_f  = np.power(vol_f, GAMMA)                  # (Z, H, W)  float32
-
-    # Resize each slice to FORCE_SIZE — still needs a loop (cv2 is 2-D only)
-    # but this is pure CPU and very fast compared to model inference.
-    H, W = FORCE_SIZE
-    resized = np.empty((Z, H, W), dtype=np.float32)
+    Z     = ct_vol.shape[0]
+    preds = np.zeros((Z, *FORCE_SIZE), dtype=np.uint8)
     for z in range(Z):
-        resized[z] = cv2.resize(vol_f[z], (W, H), interpolation=cv2.INTER_LINEAR)
-
-    # ── Single CPU→GPU transfer for all slices ─────────────────────────────
-    # Shape: (Z, 1, H, W) — add channel dim expected by the model
-    vol_t = torch.from_numpy(resized[:, None]).float().to(device, non_blocking=True)
-
-    # ── Batched inference — one forward pass per batch_size slices ─────────
-    device_type = "cuda" if "cuda" in str(device) else "cpu"
-    preds_gpu   = torch.empty(Z, H, W, dtype=torch.long, device=device)
-
-    for start in range(0, Z, batch_size):
-        end   = min(start + batch_size, Z)
-        batch = vol_t[start:end]                     # (bs, 1, H, W) — slice of same tensor, no copy
-        with torch.amp.autocast(device_type=device_type,
-                                enabled=(device_type == "cuda")):
-            logits = model(batch)                    # (bs, C, H, W)
-        preds_gpu[start:end] = logits.argmax(dim=1) # stays on GPU
-
-    # ── Single GPU→CPU transfer for all predictions ────────────────────────
-    return preds_gpu.cpu().numpy().astype(np.uint8)  # (Z, H, W)
+        preds[z] = predict_mask(model, ct_vol[z], device=device)
+    return preds
 
 
 # ============================================================
 # Visualisation (called from main.py)
 # ============================================================
 
+# RGBA colour for each class: bg=transparent, liver=green, tumour=red
 _CLS_COLORS = np.array([
-    [0,   0,   0,   0  ],     # background — transparent
-    [34,  192, 135, 160],     # liver      — green
-    [232, 64,  64,  200],     # tumour     — red
+    [0,   0,   0,   0  ],
+    [34,  192, 135, 160],
+    [232, 64,  64,  200],
 ], dtype=np.uint8)
 
 
 def _colour_mask(mask: np.ndarray) -> np.ndarray:
-    """Map integer mask (H, W) → RGB uint8."""
+    """Map integer mask (H, W) → RGB uint8 image."""
     rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
     rgb[mask == 0] = [40,  40,  40]
     rgb[mask == 1] = [34,  192, 135]
@@ -573,7 +433,7 @@ def _overlay_mask(
     mask:     np.ndarray,   # (H, W) int
     alpha:    float = 0.45,
 ) -> np.ndarray:
-    """Blend coloured mask over greyscale image → (H, W, 3) uint8."""
+    """Blend coloured mask over grayscale image → (H, W, 3) uint8."""
     rgb = (np.stack([img_norm] * 3, axis=-1) * 255).astype(np.uint8)
     for c in range(1, NUM_CLASSES):
         col   = _CLS_COLORS[c, :3].astype(np.float32)
@@ -587,33 +447,27 @@ def _overlay_mask(
 
 
 def visualise_seg_batch(
-    imgs:        torch.Tensor,   # (B, 1, H, W) preprocessed [0, 1]
-    gt_masks:    torch.Tensor,   # (B, H, W)    long
-    pred_logits: torch.Tensor,   # (B, C, H, W)
-    epoch:       int,
-    vis_dir:     str,
-    max_samples: int = 4,
+    imgs:         torch.Tensor,    # (B, 1, H, W)  preprocessed, in [0,1]
+    gt_masks:     torch.Tensor,    # (B, H, W)     long
+    pred_logits:  torch.Tensor,    # (B, C, H, W)
+    epoch:        int,
+    vis_dir:      str,
+    max_samples:  int = 4,
 ) -> None:
     """
-    Save 5-panel PNGs for up to max_samples examples:
+    Save a grid of 5-panel PNGs for up to max_samples examples from a batch:
         CT | GT mask | Pred mask | GT overlay | Pred overlay
-
-    FIX: compute_seg_metrics is called on whatever device the tensors are on
-    (GPU during training).  The old code forced .cpu() before the call, which
-    was redundant since compute_seg_metrics now handles any device internally.
-    The .cpu().numpy() calls for plotting are kept only where they're actually
-    needed (the numpy visualisation ops).
     """
     vis_dir = Path(vis_dir)
     vis_dir.mkdir(parents=True, exist_ok=True)
 
-    preds = pred_logits.argmax(dim=1)
+    preds = pred_logits.argmax(dim=1)   # (B, H, W)
     B     = min(imgs.shape[0], max_samples)
 
     for i in range(B):
-        img_np  = imgs[i, 0].cpu().numpy()
-        gt_np   = gt_masks[i].cpu().numpy()
-        pred_np = preds[i].cpu().numpy()
+        img_np  = imgs[i, 0].cpu().numpy()          # (H, W)
+        gt_np   = gt_masks[i].cpu().numpy()          # (H, W)
+        pred_np = preds[i].cpu().numpy()             # (H, W)
 
         gt_rgb   = _colour_mask(gt_np)
         pred_rgb = _colour_mask(pred_np)
@@ -624,20 +478,21 @@ def visualise_seg_batch(
         fig.patch.set_facecolor("#111827")
 
         panels = [
-            (img_np,   "CT input",     "gray"),
-            (gt_rgb,   "GT mask",      None),
-            (pred_rgb, "Pred mask",    None),
-            (gt_ov,    "GT overlay",   None),
-            (pred_ov,  "Pred overlay", None),
+            (img_np,   "CT input",    "gray"),
+            (gt_rgb,   "GT mask",     None),
+            (pred_rgb, "Pred mask",   None),
+            (gt_ov,    "GT overlay",  None),
+            (pred_ov,  "Pred overlay",None),
         ]
         for ax, (img, title, cmap) in zip(axs, panels):
             ax.imshow(img, cmap=cmap)
             ax.set_title(title, color="#e5e7eb", fontsize=9, pad=3)
             ax.axis("off")
 
+        # Per-sample Dice for liver and tumour
         m = compute_seg_metrics(
-            pred_logits[i:i+1],
-            gt_masks[i:i+1],
+            pred_logits[i:i+1].cpu(),
+            gt_masks[i:i+1].cpu(),
         )
         fig.suptitle(
             f"Epoch {epoch}  |  "
