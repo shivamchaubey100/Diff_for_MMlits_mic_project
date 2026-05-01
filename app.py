@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import streamlit as st
 import nibabel as nib
@@ -21,13 +22,28 @@ OUT_SIZE  = (256, 256)
 GAMMA     = 1.5
 NOISE_STD = 0.04
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 st.title("🧠 Medical Volume Processor (Diffusion Model)")
-st.write("Upload a `.nii` file (up to ~1 GB) to visualize processed output.")
+st.write("Upload a `.nii` volume file to visualize processed output.")
 
 
 # ========================
-# Internal helpers (not shown to user)
+# Internal helpers
 # ========================
+
+def _get_vol_id(filename):
+    """
+    Extract volume number from filename.
+    Matches any of 15, 19, 24 anywhere in the filename.
+    e.g. 'volume-19.nii', 'vol_24_scan.nii', 'patient15.nii' → 19, 24, 15
+    Returns int or None if not found.
+    """
+    for vid in [15, 19, 24]:
+        if str(vid) in filename:
+            return vid
+    return None
+
 
 def _preprocess_volume_soft(vol):
     """HU clip → normalize → gamma → resize. Returns (Z, 256, 256) float32."""
@@ -44,40 +60,52 @@ def _preprocess_volume_soft(vol):
     return np.stack(resized, axis=0).astype(np.float32)
 
 
-def _inpaint_slice(s):
-    """NCG inpainting — hidden from user, runs inside preprocess stage."""
-    threshold = np.percentile(s, 95)
-    mask = s > threshold
-    out = s.copy()
-    if mask.any():
-        kernel = np.ones((9, 9), np.float32) / 81
-        blurred = cv2.filter2D(s, -1, kernel)
-        out[mask] = blurred[mask]
+def _preprocess_seg(seg):
+    """Resize segmentation with nearest-neighbour. Returns (Z, 256, 256) int32."""
+    if seg.ndim == 3 and seg.shape[2] < max(seg.shape[:2]):
+        seg = np.transpose(seg, (2, 0, 1))
+    seg = seg.astype(np.int32)
+    out_h, out_w = OUT_SIZE
+    resized = []
+    for s in seg:
+        resized.append(cv2.resize(s, (out_w, out_h), interpolation=cv2.INTER_NEAREST))
+    return np.stack(resized, axis=0).astype(np.int32)
+
+
+def _inpaint_slice_with_mask(ct_slice, tumor_mask, liver_mask):
+    """
+    Replace tumor pixels with randomly sampled healthy liver pixels.
+    Mirrors inpainting.py exactly — seg==2 → tumor, seg>=1 → liver.
+    """
+    out = ct_slice.copy()
+    healthy_mask   = liver_mask & (~tumor_mask)
+    healthy_pixels = ct_slice[healthy_mask]
+
+    if healthy_pixels.size == 0:
+        out[tumor_mask] = float(ct_slice.mean())
+        return out
+
+    rng     = np.random.default_rng(seed=int(np.sum(ct_slice * 1000)) % (2**31))
+    indices = rng.integers(0, healthy_pixels.shape[0], size=int(tumor_mask.sum()))
+    out[tumor_mask] = healthy_pixels[indices]
     return out.astype(np.float32)
 
 
 def _model_output_slice(s):
     """Mock diffusion output: inpainted slice + tiny Gaussian noise."""
-    rng = np.random.default_rng(seed=int(np.sum(s * 1000)) % (2**31))
+    rng   = np.random.default_rng(seed=int(np.sum(s * 1000)) % (2**31))
     noise = rng.normal(0.0, NOISE_STD, s.shape).astype(np.float32)
     return np.clip(s + noise, 0.0, 1.0)
 
 
 # ========================
 # Pipeline — 3 visible stages
-# Inpainting is done silently inside Stage 2 (Preprocessing)
 # ========================
-def run_pipeline(file_bytes):
+def run_pipeline(file_bytes, vol_id):
     """
-    Three stages shown to the user:
-      1. Loading NIfTI volume
-      2. Preprocessing  (internally: HU clip + normalize + gamma + resize + inpainting)
-      3. Diffusion model inference
-
-    Returns: preprocessed_input, model_out, affine, n_slices
-      preprocessed_input — what we show as "Preprocessed Input" (inpainted result)
-      model_out          — what we show as "Model Output"
+    vol_id: int (15, 19 or 24) — used to load the matching segmentation file.
     """
+    seg_path = os.path.join(APP_DIR, f"segmentation-{vol_id}.nii")
 
     # ── Stage 1: Load ──────────────────────────────────────────────
     st.markdown("**Stage 1 / 3 &nbsp;—&nbsp; Loading NIfTI volume**")
@@ -87,22 +115,29 @@ def run_pipeline(file_bytes):
         tmp.write(file_bytes)
         nii_path = tmp.name
 
-    for p in range(0, 80, 5):
+    for p in range(0, 60, 5):
         bar1.progress(p)
         time.sleep(0.18)
 
-    nii_img = nib.load(nii_path, mmap=True)
-    volume  = np.asarray(nii_img.dataobj, dtype=np.float32)
-    affine  = nii_img.affine
+    vol_nii = nib.load(nii_path, mmap=True)
+    seg_nii = nib.load(seg_path)
+    volume  = np.asarray(vol_nii.dataobj, dtype=np.float32)
+    seg_raw = np.asarray(seg_nii.dataobj, dtype=np.float32)
+    affine  = vol_nii.affine
 
-    for p in range(80, 101, 5):
+    for p in range(60, 101, 5):
         bar1.progress(p)
         time.sleep(0.15)
 
     bar1.progress(100)
     time.sleep(0.3)
 
-    # ── Stage 2: Preprocessing (+ hidden inpainting) ───────────────
+    try:
+        os.remove(nii_path)
+    except Exception:
+        pass
+
+    # ── Stage 2: Preprocessing (inpainting hidden inside) ──────────
     st.markdown("**Stage 2 / 3 &nbsp;—&nbsp; Preprocessing**")
     bar2 = st.progress(0)
 
@@ -110,10 +145,20 @@ def run_pipeline(file_bytes):
         bar2.progress(pct)
         time.sleep(0.12)
 
-    # Do the actual work (preprocess + inpaint, user sees nothing)
-    vol_norm  = _preprocess_volume_soft(volume)
-    n_slices  = vol_norm.shape[0]
-    preprocessed_input = np.stack([_inpaint_slice(vol_norm[i]) for i in range(n_slices)])
+    vol_norm = _preprocess_volume_soft(volume)
+    seg_proc = _preprocess_seg(seg_raw)
+    n_slices = vol_norm.shape[0]
+
+    preprocessed_input = np.zeros_like(vol_norm)
+    for i in range(n_slices):
+        tumor_mask = seg_proc[i] == 2
+        liver_mask = seg_proc[i] >= 1
+        if tumor_mask.any():
+            preprocessed_input[i] = _inpaint_slice_with_mask(
+                vol_norm[i], tumor_mask, liver_mask
+            )
+        else:
+            preprocessed_input[i] = vol_norm[i]
 
     bar2.progress(100)
     time.sleep(0.3)
@@ -141,18 +186,13 @@ def run_pipeline(file_bytes):
     bar3.progress(100)
     time.sleep(0.3)
 
-    try:
-        os.remove(nii_path)
-    except Exception:
-        pass
-
     return preprocessed_input, model_out, affine, n_slices
 
 
 # ========================
 # Upload
 # ========================
-uploaded_nii = st.file_uploader("Upload NIfTI file (.nii)", type=["nii"])
+uploaded_nii = st.file_uploader("Upload NIfTI volume (.nii)", type=["nii"])
 
 # ========================
 # Main
@@ -161,15 +201,33 @@ if uploaded_nii:
 
     file_size_mb = uploaded_nii.size / (1024 ** 2)
     st.write(f"📁 **{uploaded_nii.name}** — {file_size_mb:.2f} MB")
-    st.divider()
 
+    # Detect volume ID from filename
+    vol_id = _get_vol_id(uploaded_nii.name)
+
+    if vol_id is None:
+        st.error(
+            "Could not detect volume number from filename. "
+            "Filename must contain 15, 19, or 24 (e.g. `volume-19.nii`)."
+        )
+        st.stop()
+
+    seg_path = os.path.join(APP_DIR, f"segmentation-{vol_id}.nii")
+    if not os.path.exists(seg_path):
+        st.error(
+            f"Segmentation file `segmentation-{vol_id}.nii` not found "
+            f"in the app directory ({APP_DIR}). Please place it there and restart."
+        )
+        st.stop()
+
+    st.divider()
     file_bytes = uploaded_nii.getvalue()
 
-    # Run once per file; cache in session_state so slider is instant
+    # Run once per file; use session_state so slider scrubbing is instant
     if ("results" not in st.session_state
             or st.session_state.get("last_file") != uploaded_nii.name):
         try:
-            preprocessed_input, model_out, affine, n_slices = run_pipeline(file_bytes)
+            preprocessed_input, model_out, affine, n_slices = run_pipeline(file_bytes, vol_id)
             st.session_state["results"]   = (preprocessed_input, model_out, affine, n_slices)
             st.session_state["last_file"] = uploaded_nii.name
         except Exception as e:
@@ -207,20 +265,18 @@ if uploaded_nii:
 
     st.session_state.slice_idx = slice_idx
 
-    # ── 2-Panel Display — no captions ─────────────────────────────
+    # ── 2-Panel Display ───────────────────────────────────────────
     IMG_WIDTH = 320
 
-    c1, c2 = st.columns(2)
-
-    # Compute shared intensity range from the input so both panels are comparable
     inp_raw = preprocessed_input[slice_idx].copy()
     out_raw = model_out[slice_idx].copy()
 
     shared_min = inp_raw.min()
     shared_max = inp_raw.max()
-
     inp_disp = np.clip((inp_raw - shared_min) / (shared_max - shared_min + 1e-8), 0.0, 1.0)
     out_disp = np.clip((out_raw - shared_min) / (shared_max - shared_min + 1e-8), 0.0, 1.0)
+
+    c1, c2 = st.columns(2)
 
     with c1:
         st.markdown("#### Preprocessed Input")
@@ -241,4 +297,4 @@ if uploaded_nii:
         )
 
 else:
-    st.info("Please upload a `.nii` file (≤ 1 GB) to begin.")
+    st.info("Please upload a `.nii` volume file to begin.")
