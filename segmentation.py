@@ -14,7 +14,7 @@ seg_loss            — combined weighted-CE + soft-Dice loss
 compute_seg_metrics — per-class Dice + mean IoU
 save_seg_checkpoint / load_seg_checkpoint
 predict_mask        — single 2-D slice  → predicted mask (H, W)
-predict_volume      — full 3-D volume   → predicted mask (Z, H, W)  [batched GPU]
+predict_volume      — full 3-D volume   → predicted mask (Z, H, W)
 visualise_seg_batch — save PNG panels for a batch (called from main.py)
 
 Fixes vs previous version
@@ -236,15 +236,12 @@ def seg_loss(
     class_weights upweights rare classes (tumour = class 2).
     Default [0.2, 1.0, 5.0] heavily penalises missing tumour.
 
-    FIX: class_weights tensor is now created on logits.device instead of a
-    hardcoded "cuda" string.  Passing device="cpu" logits to the old code
-    would silently create the weight tensor on CUDA, causing a device
-    mismatch crash on cross_entropy.  The `device` argument is retained for
-    backward API compatibility but is no longer consulted.
+    FIX: weight tensor is created on logits.device — not a hardcoded string.
+    The old device=cuda would crash when logits were on CPU or any other device.
     """
-    tensor_device = logits.device   # always matches logits — no string needed
+    tensor_device = logits.device
     if class_weights is not None:
-        w  = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        w  = torch.tensor(class_weights, dtype=torch.float32, device=tensor_device)
         ce = F.cross_entropy(logits, targets, weight=w)
     else:
         ce = F.cross_entropy(logits, targets)
@@ -267,37 +264,12 @@ def compute_seg_metrics(
 
     logits  : (B, C, H, W)
     targets : (B, H, W)  long
-
-    FIX: all comparisons and sums now stay on whatever device logits/targets
-    live on (GPU during training).  The old code called .item() inside the
-    per-class loop, causing one GPU→CPU sync per class per batch step.
-    Now we do vectorised tensor ops across all classes simultaneously and
-    pull a single flat array to CPU once at the very end.
     """
-    device = logits.device
-    preds  = logits.argmax(dim=1)   # (B, H, W) — stays on GPU
+    preds = logits.argmax(dim=1)
+    out   = {}
+    dices = []
+    ious  = []
 
-    # Build class indicator tensors for all classes at once: (C, B, H, W)
-    # arange gives [0, 1, 2] → compare against preds and targets in one op
-    cls = torch.arange(num_classes, device=device).view(-1, 1, 1, 1)  # (C,1,1,1)
-
-    pc    = (preds.unsqueeze(0)   == cls).float()   # (C, B, H, W)
-    tc    = (targets.unsqueeze(0) == cls).float()   # (C, B, H, W)
-
-    # Sum over B, H, W — stays on GPU
-    inter = (pc * tc).sum(dim=(1, 2, 3))            # (C,)
-    p_sum = pc.sum(dim=(1, 2, 3))                   # (C,)
-    t_sum = tc.sum(dim=(1, 2, 3))                   # (C,)
-    union = p_sum + t_sum                           # (C,)
-
-    dice  = (2.0 * inter + 1e-6) / (union + 1e-6)          # (C,)
-    iou   = (inter + 1e-6) / (union - inter + 1e-6)        # (C,)
-
-    # Single transfer: pull both vectors to CPU numpy in one call
-    dice_np = dice.cpu().numpy()
-    iou_np  = iou.cpu().numpy()
-
-    out = {}
     for c in range(num_classes):
         pc    = (preds   == c).float()
         tc    = (targets == c).float()
@@ -310,8 +282,8 @@ def compute_seg_metrics(
         dices.append(dice)
         ious.append(iou)
 
-    out["mean_dice"] = float(dice_np.mean())
-    out["mean_iou"]  = float(iou_np.mean())
+    out["mean_dice"] = float(np.mean(dices))
+    out["mean_iou"]  = float(np.mean(ious))
     return out
 
 
@@ -427,16 +399,12 @@ def save_seg_checkpoint(
 def load_seg_checkpoint(
     model:    nn.Module,
     ckpt_dir: str,
-    device:   str = "cpu",   # FIX: was "cuda" — safe default that works without GPU
+    device:   str = "cuda",
     opt=None,
 ) -> Tuple[nn.Module, int]:
     """
     Load the latest seg_epoch_XXXX.pt from ckpt_dir.
     Returns (model, start_epoch).
-
-    FIX: default device changed from "cuda" to "cpu".  The old default would
-    crash on machines without a GPU.  The caller (main.py) always passes the
-    correct device string explicitly anyway.
     """
     import glob
     files = sorted(glob.glob(str(Path(ckpt_dir) / "seg_epoch_*.pt")))
@@ -468,9 +436,6 @@ def predict_mask(
     """
     Predict segmentation mask for a single 2-D CT slice.
     Returns np.ndarray (H, W) with values in {0, 1, 2}.
-
-    Prefer predict_volume for full 3-D volumes — it batches slices on GPU
-    and is significantly faster than calling this in a loop.
     """
     model.eval()
     pp = _preprocess_slice(img_slice)
@@ -488,64 +453,53 @@ def predict_mask(
 
 @torch.no_grad()
 def predict_volume(
-    model:  nn.Module,
-    ct_vol: np.ndarray,   # (Z, H, W) raw HU float
-    device: str = "cuda",
+    model:      nn.Module,
+    ct_vol:     np.ndarray,   # (Z, H, W) raw HU float
+    device:     str = "cuda",
+    batch_size: int = 16,     # slices per GPU batch — reduce if OOM
 ) -> np.ndarray:
     """
     Predict segmentation mask for a full 3-D CT volume.
     Returns np.ndarray (Z, H, W) with values in {0, 1, 2}.
 
-    FIX: replaced the old slice-by-slice Python loop with a batched GPU
-    path.  All preprocessing is vectorised over Z via numpy, then slices
-    are transferred to the device in one go and processed in mini-batches.
-
-    Old approach: Z individual model forward passes + Z GPU→CPU syncs.
-    New approach: ceil(Z / batch_size) forward passes, one GPU→CPU sync.
-    Typical speed-up: 10–30× for a 512-slice volume on a T4.
-
-    Args:
-        model      : SegUNet already on the target device
-        ct_vol     : (Z, H, W) array of raw HU values
-        device     : device string matching where model lives
-        batch_size : number of slices per forward pass (reduce if OOM)
+    FIX: replaced slice-by-slice Python loop with a batched GPU path.
+    All slices are preprocessed via vectorised numpy, transferred to the
+    device in one call, and processed in mini-batches of batch_size.
+    One GPU->CPU sync at the end instead of Z individual syncs.
+    Typical speed-up: 10-30x for a 512-slice volume on a T4.
     """
     model.eval()
     Z = ct_vol.shape[0]
 
-    # ── Preprocessing — fully vectorised over Z (no Python loop) ──────────
-    # _preprocess_slice operates element-wise, so we can apply it to the
-    # whole volume array at once.
-    vol_f  = np.clip(ct_vol, CLIP_MIN, CLIP_MAX).astype(np.float32)
-    vol_f  = (vol_f - CLIP_MIN) / float(CLIP_MAX - CLIP_MIN)
-    vol_f  = np.clip(vol_f, 0.0, 1.0)
-    vol_f  = np.power(vol_f, GAMMA)                  # (Z, H, W)  float32
+    # Vectorised preprocessing over all Z slices at once
+    vol_f = np.clip(ct_vol, CLIP_MIN, CLIP_MAX).astype(np.float32)
+    vol_f = (vol_f - CLIP_MIN) / float(CLIP_MAX - CLIP_MIN)
+    vol_f = np.clip(vol_f, 0.0, 1.0)
+    vol_f = np.power(vol_f, GAMMA)                   # (Z, H, W)
 
-    # Resize each slice to FORCE_SIZE — still needs a loop (cv2 is 2-D only)
-    # but this is pure CPU and very fast compared to model inference.
-    H, W = FORCE_SIZE
+    # Resize still needs a loop (cv2 is 2-D only) but is CPU-fast
+    H, W    = FORCE_SIZE
     resized = np.empty((Z, H, W), dtype=np.float32)
     for z in range(Z):
         resized[z] = cv2.resize(vol_f[z], (W, H), interpolation=cv2.INTER_LINEAR)
 
-    # ── Single CPU→GPU transfer for all slices ─────────────────────────────
-    # Shape: (Z, 1, H, W) — add channel dim expected by the model
+    # Single CPU->GPU transfer for all slices
     vol_t = torch.from_numpy(resized[:, None]).float().to(device, non_blocking=True)
 
-    # ── Batched inference — one forward pass per batch_size slices ─────────
+    # Batched inference on GPU
     device_type = "cuda" if "cuda" in str(device) else "cpu"
     preds_gpu   = torch.empty(Z, H, W, dtype=torch.long, device=device)
 
     for start in range(0, Z, batch_size):
         end   = min(start + batch_size, Z)
-        batch = vol_t[start:end]                     # (bs, 1, H, W) — slice of same tensor, no copy
+        batch = vol_t[start:end]
         with torch.amp.autocast(device_type=device_type,
                                 enabled=(device_type == "cuda")):
-            logits = model(batch)                    # (bs, C, H, W)
-        preds_gpu[start:end] = logits.argmax(dim=1) # stays on GPU
+            logits = model(batch)
+        preds_gpu[start:end] = logits.argmax(dim=1)
 
-    # ── Single GPU→CPU transfer for all predictions ────────────────────────
-    return preds_gpu.cpu().numpy().astype(np.uint8)  # (Z, H, W)
+    # Single GPU->CPU transfer for all predictions
+    return preds_gpu.cpu().numpy().astype(np.uint8)
 
 
 # ============================================================
@@ -597,12 +551,6 @@ def visualise_seg_batch(
     """
     Save 5-panel PNGs for up to max_samples examples:
         CT | GT mask | Pred mask | GT overlay | Pred overlay
-
-    FIX: compute_seg_metrics is called on whatever device the tensors are on
-    (GPU during training).  The old code forced .cpu() before the call, which
-    was redundant since compute_seg_metrics now handles any device internally.
-    The .cpu().numpy() calls for plotting are kept only where they're actually
-    needed (the numpy visualisation ops).
     """
     vis_dir = Path(vis_dir)
     vis_dir.mkdir(parents=True, exist_ok=True)
@@ -636,8 +584,8 @@ def visualise_seg_batch(
             ax.axis("off")
 
         m = compute_seg_metrics(
-            pred_logits[i:i+1],
-            gt_masks[i:i+1],
+            pred_logits[i:i+1].cpu(),
+            gt_masks[i:i+1].cpu(),
         )
         fig.suptitle(
             f"Epoch {epoch}  |  "

@@ -1,10 +1,13 @@
 # models.py
-# Enhanced U-Net — skip connections aligned, cond padding correct.
-# Fixes vs previous version:
-#   1. GroupNorm group count is now computed dynamically so any base_ch works.
-#   2. Mid-block dispatch uses a typed wrapper instead of isinstance checks,
-#      making it safe to add new block types in future.
-#   3. Minor: SinusoidalPosEmb half-dim edge-case guarded.
+#
+# Enhanced U-Net for conditional diffusion.
+#
+# Fixes vs previous version
+# --------------------------
+#   FIX (bug #4): num_heads in _attn() is now computed dynamically via
+#                 _safe_num_heads() instead of being hardcoded to 4.
+#                 AttentionBlock asserts channels % num_heads == 0, so
+#                 hardcoding 4 silently fails for some base_ch values.
 
 import math
 import torch
@@ -14,20 +17,28 @@ from einops import rearrange
 
 
 # ---------------------------------------------------------------------------
-# Utility
+# Utilities
 # ---------------------------------------------------------------------------
 
 def make_norm(channels: int) -> nn.GroupNorm:
-    """GroupNorm with a safe group count.
-
-    GroupNorm requires channels % num_groups == 0.  Using a fixed value of 8
-    breaks whenever base_ch is not a multiple of 8.  We pick the largest
-    power-of-two divisor up to 32, which works for any channel count >= 1.
-    """
+    """GroupNorm with a safe group count for any channel width."""
     for g in (32, 16, 8, 4, 2, 1):
         if channels % g == 0:
             return nn.GroupNorm(g, channels)
-    return nn.GroupNorm(1, channels)   # fallback (should never reach here)
+    return nn.GroupNorm(1, channels)
+
+
+def _safe_num_heads(channels: int, preferred: int = 4) -> int:
+    """
+    Largest divisor of channels that is <= preferred.
+
+    FIX (bug #4): prevents AttentionBlock assertion failure when
+    channels is not divisible by the hardcoded preferred value.
+    """
+    for h in range(preferred, 0, -1):
+        if channels % h == 0:
+            return h
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -44,14 +55,10 @@ class SinusoidalPosEmb(nn.Module):
             t = t.float()
         device = t.device
         half   = max(self.dim // 2, 1)
-        # guard against half == 1 which would make arange(1) and log degenerate
-        if half > 1:
-            freq_exp = math.log(10000) / (half - 1)
-        else:
-            freq_exp = 0.0
-        freqs = torch.exp(-freq_exp * torch.arange(half, device=device))
-        emb   = t[:, None] * freqs[None, :]
-        return torch.cat((emb.sin(), emb.cos()), dim=-1)   # (B, dim)
+        freq_exp = math.log(10000) / (half - 1) if half > 1 else 0.0
+        freqs    = torch.exp(-freq_exp * torch.arange(half, device=device))
+        emb      = t[:, None] * freqs[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -120,15 +127,11 @@ class AttentionBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Unified block wrapper — avoids isinstance dispatch in the forward pass
+# Unified block wrapper
 # ---------------------------------------------------------------------------
 
 class _Block(nn.Module):
-    """Thin wrapper that gives every block a uniform (x, t_emb) call signature.
-
-    ResBlock needs t_emb; AttentionBlock does not.  Rather than scattering
-    isinstance checks through the UNet forward, we wrap each block here.
-    """
+    """Uniform (x, t_emb) call signature for ResBlock and AttentionBlock."""
     def __init__(self, block: nn.Module, needs_t: bool):
         super().__init__()
         self.block   = block
@@ -141,7 +144,9 @@ class _Block(nn.Module):
 def _res(in_ch, out_ch, time_dim, dropout):
     return _Block(ResBlock(in_ch, out_ch, time_dim, dropout), needs_t=True)
 
-def _attn(channels, num_heads=4):
+def _attn(channels, preferred_heads: int = 4):
+    # FIX (bug #4): compute safe num_heads dynamically
+    num_heads = _safe_num_heads(channels, preferred_heads)
     return _Block(AttentionBlock(channels, num_heads), needs_t=False)
 
 def _identity():
@@ -157,29 +162,27 @@ class EnhancedUNet(nn.Module):
     Conditional denoising U-Net for diffusion models.
 
     Args:
-        in_ch        : channels in the noisy input (e.g. 1 for grayscale CT)
-        cond_ch      : channels in the conditioning tensor
-                       (e.g. 2 = healthy CT + liver mask)
-        base_ch      : base channel width; must be divisible by the largest
-                       group count chosen by make_norm (multiples of 8 are safe)
-        ch_mult      : channel multipliers per encoder level
-        num_res_blocks: ResBlocks per level (excluding the extra skip-consuming
-                        block at the top of each decoder level)
-        time_dim     : sinusoidal embedding + MLP output dimension
-        dropout      : dropout probability in ResBlocks
-        use_attention: whether to place a self-attention block in the bottleneck
+        in_ch          : channels in the noisy input (1 for grayscale CT)
+        cond_ch        : channels in the conditioning tensor
+                         (2 = healthy CT + liver mask)
+        base_ch        : base channel width (multiples of 8 recommended)
+        ch_mult        : channel multipliers per encoder level
+        num_res_blocks : ResBlocks per level
+        time_dim       : sinusoidal embedding + MLP output dimension
+        dropout        : dropout probability in ResBlocks
+        use_attention  : whether to place self-attention in the bottleneck
     """
 
     def __init__(
         self,
-        in_ch:         int   = 1,
-        cond_ch:       int   = 2,
-        base_ch:       int   = 48,
-        ch_mult:       tuple = (1, 2, 4),
-        num_res_blocks: int  = 2,
-        time_dim:      int   = 256,
-        dropout:       float = 0.1,
-        use_attention: bool  = True,
+        in_ch:          int   = 1,
+        cond_ch:        int   = 2,
+        base_ch:        int   = 48,
+        ch_mult:        tuple = (1, 2, 4),
+        num_res_blocks: int   = 2,
+        time_dim:       int   = 256,
+        dropout:        float = 0.1,
+        use_attention:  bool  = True,
     ):
         super().__init__()
 
@@ -201,9 +204,9 @@ class EnhancedUNet(nn.Module):
         self.input_conv = nn.Conv2d(in_ch + cond_ch, base_ch, 3, padding=1)
 
         # ── encoder ────────────────────────────────────────────────────────
-        in_channels          = base_ch
-        self.encoder_levels  = nn.ModuleList()
-        self.downsamples     = nn.ModuleList()
+        in_channels         = base_ch
+        self.encoder_levels = nn.ModuleList()
+        self.downsamples    = nn.ModuleList()
 
         for mult in self.ch_mult:
             out_channels = base_ch * mult
@@ -214,7 +217,7 @@ class EnhancedUNet(nn.Module):
             self.encoder_levels.append(blocks)
             in_channels = out_channels
 
-            if mult != self.ch_mult[-1]:           # no downsample after last level
+            if mult != self.ch_mult[-1]:
                 self.downsamples.append(
                     nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=1)
                 )
@@ -227,33 +230,22 @@ class EnhancedUNet(nn.Module):
         ])
 
         # ── decoder ─────────────────────────────────────────────────────────
-        # For each decoder level we:
-        #   1. Upsample (except the very first level which is at bottleneck res)
-        #   2. Concatenate the matching encoder skip
-        #   3. Run (1 + num_res_blocks) ResBlocks
-        #
-        # Skip channel sizes (from encoder, in reverse order):
-        #   level 0 (top of decoder) receives skip from last encoder level  → base_ch * ch_mult[-1]
-        #   level 1                                                          → base_ch * ch_mult[-2]
-        #   …
-        rev_mult             = list(reversed(self.ch_mult))
-        self.upsamples       = nn.ModuleList()
-        self.decoder_levels  = nn.ModuleList()
+        rev_mult            = list(reversed(self.ch_mult))
+        self.upsamples      = nn.ModuleList()
+        self.decoder_levels = nn.ModuleList()
 
-        cur_ch = in_channels          # channels currently in h (= bottleneck channels)
+        cur_ch = in_channels
 
         for i, mult in enumerate(rev_mult):
-            skip_ch = base_ch * mult  # channels of the corresponding encoder skip
+            skip_ch = base_ch * mult
             out_ch  = base_ch * mult
 
             if i != 0:
-                # ConvTranspose2d: in=cur_ch → out=cur_ch (channel count unchanged)
                 self.upsamples.append(
                     nn.ConvTranspose2d(cur_ch, cur_ch, kernel_size=4, stride=2, padding=1)
                 )
 
             blocks = nn.ModuleList()
-            # first block consumes concatenated (cur_ch + skip_ch)
             blocks.append(_res(cur_ch + skip_ch, out_ch, time_dim, dropout))
             for _ in range(num_res_blocks):
                 blocks.append(_res(out_ch, out_ch, time_dim, dropout))
@@ -276,60 +268,42 @@ class EnhancedUNet(nn.Module):
         t:         torch.Tensor,
         drop_cond: bool = False,
     ) -> torch.Tensor:
-        """
-        Args:
-            x        : noisy image,   (B, in_ch, H, W)
-            cond     : conditioning,  (B, cond_ch, H, W)
-            t        : timesteps,     (B,)   integer or float
-            drop_cond: if True, zero out the conditioning (CFG training)
 
-        Returns:
-            predicted v (or eps) with the same shape as x
-        """
-
-        # ── classifier-free guidance conditioning dropout ───────────────────
         if drop_cond:
             cond = torch.zeros_like(cond)
 
-        # ── pad cond channels if fewer than expected (e.g. inference w/o mask) ─
         if cond.shape[1] < self.cond_ch:
-            pad  = torch.zeros(
-                cond.size(0),
-                self.cond_ch - cond.shape[1],
-                cond.size(2),
-                cond.size(3),
-                device=cond.device,
-                dtype=cond.dtype,
+            pad = torch.zeros(
+                cond.size(0), self.cond_ch - cond.shape[1],
+                cond.size(2), cond.size(3),
+                device=cond.device, dtype=cond.dtype,
             )
             cond = torch.cat([cond, pad], dim=1)
 
-        # ── time embedding ──────────────────────────────────────────────────
         if not torch.is_floating_point(t):
             t = t.float()
         t_emb = self.time_mlp(t)
 
-        # ── input projection ────────────────────────────────────────────────
         h = self.input_conv(torch.cat([x, cond], dim=1))
 
-        # ── encoder ────────────────────────────────────────────────────────
+        # Encoder
         skips = []
         for idx, blocks in enumerate(self.encoder_levels):
             for blk in blocks:
                 h = blk(h, t_emb)
-            skips.append(h)                        # save skip before downsampling
+            skips.append(h)
             if idx < len(self.downsamples):
                 h = self.downsamples[idx](h)
 
-        # ── bottleneck ──────────────────────────────────────────────────────
+        # Bottleneck
         for blk in self.mid_blocks:
             h = blk(h, t_emb)
 
-        # ── decoder ─────────────────────────────────────────────────────────
+        # Decoder
         skip_idx = len(skips) - 1
         up_idx   = 0
 
         for lvl_idx, blocks in enumerate(self.decoder_levels):
-
             if lvl_idx != 0:
                 h       = self.upsamples[up_idx](h)
                 up_idx += 1
@@ -337,7 +311,6 @@ class EnhancedUNet(nn.Module):
             skip = skips[skip_idx]
             skip_idx -= 1
 
-            # fix any spatial mismatch caused by odd input dimensions
             if h.shape[2:] != skip.shape[2:]:
                 h = F.interpolate(h, size=skip.shape[2:], mode="nearest")
 
@@ -346,6 +319,5 @@ class EnhancedUNet(nn.Module):
             for blk in blocks:
                 h = blk(h, t_emb)
 
-        # ── output ──────────────────────────────────────────────────────────
         h = F.silu(self.out_norm(h))
         return self.out_conv(h)
